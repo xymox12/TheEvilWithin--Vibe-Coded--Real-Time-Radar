@@ -1,6 +1,7 @@
 import pymem
 import pymem.process
 import logging
+import time
 from typing import Any, Dict, Optional, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -27,6 +28,7 @@ RADAR_CONFIG = {
     "fps": 60,
     "width": 800,
     "height": 800,
+    "show_info_panel": False,  # Set to False to hide text overlay
 }
 
 # Colors
@@ -34,10 +36,13 @@ COLORS = {
     "background": (20, 20, 30),
     "grid": (40, 40, 50),
     "player": (0, 150, 255),
-    "enemy": (255, 50, 50),
+    "enemy": (255, 100, 0),  # Orange for idle enemies (caution)
+    "enemy_alerted": (255, 50, 50),  # Red for alerted enemies (danger!)
+    "partner": (0, 255, 100),  # Bright green for friendly NPCs
     "npc": (255, 200, 50),
     "object": (100, 100, 100),
     "text": (200, 200, 200),
+    "alert_ring": (255, 200, 0),  # Yellow ring around alerted enemies
 }
 
 ENTITY_FIELD_CONFIG = {
@@ -49,6 +54,7 @@ ENTITY_FIELD_CONFIG = {
     "z": {"offset": 0x6D0, "type": "float"},
     "rot_c": {"offset": 0x6D4, "type": "float"},
     "rot_s": {"offset": 0x6E0, "type": "float"},
+    "alertness": {"offset": 0xF44, "type": "short"},
 }
 
 
@@ -59,7 +65,8 @@ ENTITY_FIELD_CONFIG = {
 class EntityType(Enum):
     PLAYER = "player"
     ENEMY = "enemy"
-    NPC = "npc"
+    PARTNER = "partner"  # Friendly NPCs (Joseph, Kidman, etc.)
+    NPC = "npc"  # Neutral NPCs (corpses, animals, etc.)
     OBJECT = "object"
 
 
@@ -135,12 +142,17 @@ class Entity:
     class_name: str = ""
     instance_name: str = ""
     rotation: Optional[Rotation] = None
+    alertness: Optional[int] = None  # -1 = not alerted, 0 = alerted
 
     def is_valid_position(self) -> bool:
         """Check if entity has reasonable world coordinates"""
         return (abs(self.position.x) < 1_000_000 and
                 abs(self.position.y) < 1_000_000 and
                 abs(self.position.z) < 1_000_000)
+
+    def is_alerted(self) -> bool:
+        """Check if enemy is alerted to player"""
+        return self.alertness is not None and self.alertness == 0
 
 
 # ============================================================================
@@ -194,6 +206,8 @@ class GameMemoryReader:
                 return self.pm.read_string(value_address, byte=50)  # Limit string length
             elif field_type == "float":
                 return self.pm.read_float(value_address)
+            elif field_type == "short":
+                return self.pm.read_short(value_address)
             return None
 
         except (pymem.exception.MemoryReadError, pymem.exception.WinAPIError):
@@ -203,18 +217,41 @@ class GameMemoryReader:
             return None
 
     def _classify_entity(self, class_name: str, instance_name: str, health: float) -> EntityType:
-        """Determine entity type from its properties"""
+        """
+        Determine entity type from its properties.
+        
+        The Evil Within uses these class name patterns:
+        - idPlayer: Player character
+        - idPartner: Friendly NPCs (Joseph, Kidman)
+        - idNpcEnemy: Hostile enemies
+        - idNpcCorpse, idNpcAnimal_*: Neutral NPCs
+        - Other: Static objects
+        """
         class_lower = class_name.lower()
         instance_lower = instance_name.lower()
 
-        if "player" in class_lower or "player" in instance_lower:
+        # Check for player
+        if "idplayer" in class_lower or "player" in instance_lower:
             return EntityType.PLAYER
-        elif health and health > 0:
-            return EntityType.ENEMY
-        elif "npc" in class_lower or "civilian" in class_lower:
+        
+        # Check for partners (friendly NPCs)
+        if "idpartner" in class_lower:
+            return EntityType.PARTNER
+        
+        # Check for enemies - but only if alive!
+        # Dead enemies (health <= 0) should show as NPC (yellow corpses)
+        if "idnpcenemy" in class_lower or ("enemy" in class_lower):
+            if health and health > 0:
+                return EntityType.ENEMY
+            else:
+                return EntityType.NPC  # Dead enemies show as yellow
+        
+        # Check for neutral NPCs (corpses, animals, etc.)
+        if "idnpc" in class_lower or "npc" in class_lower or "civilian" in class_lower:
             return EntityType.NPC
-        else:
-            return EntityType.OBJECT
+        
+        # Everything else is an object
+        return EntityType.OBJECT
 
     def read_entity(self, base_address: int, index: int) -> Optional[Entity]:
         """Read a single entity from memory"""
@@ -252,6 +289,7 @@ class GameMemoryReader:
             class_name = fields.get("class_name") or ""
             instance_name = fields.get("instance_name") or ""
             health = fields.get("health") or 0.0
+            alertness = fields.get("alertness")
 
             entity_type = self._classify_entity(class_name, instance_name, health)
 
@@ -262,7 +300,8 @@ class GameMemoryReader:
                 health=health,
                 class_name=class_name,
                 instance_name=instance_name,
-                rotation=rotation
+                rotation=rotation,
+                alertness=alertness
             )
 
             return entity if entity.is_valid_position() else None
@@ -316,6 +355,7 @@ class RadarDisplay:
         self.max_range = config["max_range"]
         self.range_step = config["range_step"]
         self.fps = config["fps"]
+        self.show_info_panel = config.get("show_info_panel", True)  # Default to True
 
         self.center = (self.width // 2, self.height // 2)
 
@@ -385,14 +425,42 @@ class RadarDisplay:
         if entity.entity_type == EntityType.PLAYER:
             self.draw_player(screen_x, screen_y)
         elif entity.entity_type == EntityType.ENEMY:
-            pygame.draw.circle(self.screen, COLORS["enemy"], (screen_x, screen_y), 8)
+            # Determine enemy color based on alert status
+            is_alerted = entity.is_alerted()
+            enemy_color = COLORS["enemy_alerted"] if is_alerted else COLORS["enemy"]
+            
+            # Draw alert ring for alerted enemies (pulsing effect)
+            if is_alerted:
+                import time
+                pulse = abs(math.sin(time.time() * 3))  # Pulse between 0 and 1
+                ring_radius = 8 + int(pulse * 4)  # Pulse from 8 to 12 pixels
+                pygame.draw.circle(self.screen, COLORS["alert_ring"], (screen_x, screen_y), ring_radius, 2)
+            
+            # Draw main enemy circle
+            pygame.draw.circle(self.screen, enemy_color, (screen_x, screen_y), 8)
+            
             # Draw health bar for enemies
             if entity.health > 0:
                 self._draw_health_bar(screen_x, screen_y, entity.health)
+            
             # Draw direction indicator if rotation data available
             if entity.rotation and player_rotation:
                 self._draw_direction_indicator(screen_x, screen_y, entity.rotation,
-                                               player_rotation, COLORS["enemy"])
+                                               player_rotation, enemy_color)
+        elif entity.entity_type == EntityType.PARTNER:
+            # Draw partners as diamonds (friendly NPCs like Joseph, Kidman)
+            size = 8
+            points = [
+                (screen_x, screen_y - size),      # Top
+                (screen_x + size, screen_y),      # Right
+                (screen_x, screen_y + size),      # Bottom
+                (screen_x - size, screen_y),      # Left
+            ]
+            pygame.draw.polygon(self.screen, COLORS["partner"], points)
+            # Draw direction indicator for partners
+            if entity.rotation and player_rotation:
+                self._draw_direction_indicator(screen_x, screen_y, entity.rotation,
+                                               player_rotation, COLORS["partner"])
         elif entity.entity_type == EntityType.NPC:
             pygame.draw.circle(self.screen, COLORS["npc"], (screen_x, screen_y), 7)
             # Draw direction indicator for NPCs too
@@ -473,12 +541,18 @@ class RadarDisplay:
                          (x - bar_width // 2, y - 15, int(bar_width * health_pct), bar_height))
 
     def draw_info_panel(self, entity_count: int, player_found: bool,
-                        player_rotation: Optional[Rotation] = None):
+                        player_rotation: Optional[Rotation] = None, alerted_count: int = 0):
         """Draw information overlay"""
         info_lines = [
             f"Entities: {entity_count} | Range: {self.radar_range}",
             f"Player: {'FOUND' if player_found else 'NOT FOUND'}",
             f"FPS: {int(self.clock.get_fps())}",
+            "",
+            f"Legend:",
+            "▲ = Player (blue)",
+            "♦ = Partner (green)",
+            "● = Enemy (red/orange)",
+            f"  └─ {alerted_count} ALERTED! (pulsing)",
             "",
             "Controls:",
             "+/= : Zoom in",
@@ -529,6 +603,10 @@ class RadarApp:
                 # Find player
                 player = next((e for e in entities if e.entity_type == EntityType.PLAYER), None)
 
+                # Count alerted enemies
+                alerted_count = sum(1 for e in entities 
+                                   if e.entity_type == EntityType.ENEMY and e.is_alerted())
+
                 # Draw
                 self.display.draw_background()
 
@@ -551,11 +629,13 @@ class RadarApp:
                             self.display.draw_entity(entity, screen_x, screen_y, distance, player.rotation)
 
                 # Draw UI
-                self.display.draw_info_panel(
-                    len(entities),
-                    player is not None,
-                    player.rotation if player else None
-                )
+                if self.display.show_info_panel:
+                    self.display.draw_info_panel(
+                        len(entities),
+                        player is not None,
+                        player.rotation if player else None,
+                        alerted_count
+                    )
 
                 self.display.flip()
 
